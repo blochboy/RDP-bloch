@@ -17,7 +17,7 @@ jobs:
     steps:
       - name: Install tools
         shell: pwsh
-        run: choco install rclone winfsp nodejs-lts git ollama cloudflared -y --no-progress
+        run: choco install rclone ollama cloudflared -y --no-progress
 
       - name: Screen link (VNC + noVNC + Cloudflare)
         shell: pwsh
@@ -41,25 +41,39 @@ jobs:
           }
           "SCREEN_URL=$url/vnc.html?autoconnect=1&resize=scale" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
 
-      - name: Mount Google Drive as G
+      - name: Connect Google Drive
         shell: pwsh
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
         run: |
           New-Item -ItemType Directory -Force "$env:APPDATA/rclone" | Out-Null
           Set-Content "$env:APPDATA/rclone/rclone.conf" $env:RCLONE_CONF
+          rclone lsd gdrive:
+          if ($LASTEXITCODE -ne 0) { throw 'RCLONE_CONF galat hai: usme [gdrive] section hona chahiye' }
+          rclone mkdir gdrive:handoff
+          rclone mkdir gdrive:wa-session
+
+      - name: Mount Drive as G (optional)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
           Start-Process rclone -ArgumentList 'mount gdrive: G: --vfs-cache-mode full' -WindowStyle Hidden
-          for ($i=0; $i -lt 30 -and -not (Test-Path 'G:/'); $i++) { Start-Sleep 2 }
-          New-Item -ItemType Directory -Force 'G:/handoff', 'G:/wa-session' | Out-Null
 
       - name: Wait for previous machine to hand over
         shell: pwsh
         run: |
-          if (Test-Path 'G:/handoff/active.txt') {
-            for ($i=0; $i -lt 60 -and -not (Test-Path 'G:/handoff/ready.txt'); $i++) { Start-Sleep 10 }
+          $files = @(rclone lsf gdrive:handoff --files-only)
+          if ($files -contains 'active.txt') {
+            for ($i=0; $i -lt 60; $i++) {
+              $files = @(rclone lsf gdrive:handoff --files-only)
+              if ($files -contains 'ready.txt') { break }
+              Start-Sleep 10
+            }
           }
-          Remove-Item 'G:/handoff/ready.txt' -ErrorAction SilentlyContinue
-          Set-Content 'G:/handoff/active.txt' (Get-Date -Format o)
+          rclone delete gdrive:handoff --include ready.txt
+          Set-Content "$env:TEMP/active.txt" (Get-Date -Format o)
+          rclone copyto "$env:TEMP/active.txt" gdrive:handoff/active.txt
 
       - name: Start Ollama
         shell: pwsh
@@ -77,7 +91,7 @@ jobs:
           Set-Location C:/bot
           npm install --no-audit --no-fund
           npm install @whiskeysockets/baileys --no-audit --no-fund
-          Copy-Item 'G:/wa-session' $env:SESSION_DIR -Recurse -Force
+          rclone copy gdrive:wa-session $env:SESSION_DIR
           $notify = @'
           const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
           (async () => {
@@ -94,7 +108,8 @@ jobs:
           '@
           Set-Content C:/bot/notify.js $notify
           node notify.js "Nayi machine taiyar hai. Screen link: $env:SCREEN_URL"
-          Start-Process node -ArgumentList 'index.js' -WorkingDirectory C:/bot -WindowStyle Hidden
+          $bot = Start-Process node -ArgumentList 'index.js' -WorkingDirectory C:/bot -WindowStyle Hidden -PassThru
+          Set-Content C:/bot.pid $bot.Id
 
       # UI-TARS: yahan apna screen-control agent start karein (alag se test karna hoga)
 
@@ -103,11 +118,12 @@ jobs:
         run: |
           Start-Sleep -Seconds ([int]$env:HANDOFF_AFTER_MIN * 60)
           gh workflow run server.yml --repo $env:GITHUB_REPOSITORY
-          Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force
+          Stop-Process -Id ([int](Get-Content C:/bot.pid)) -Force -ErrorAction SilentlyContinue
           Start-Sleep 5
-          Copy-Item "$env:SESSION_DIR/*" 'G:/wa-session' -Recurse -Force
+          rclone copy $env:SESSION_DIR gdrive:wa-session
           Set-Location C:/bot
           node notify.js 'Kuch minute mein nayi machine taiyar hogi, bot thodi der band rahega.'
-          Start-Sleep 30
-          Set-Content 'G:/handoff/ready.txt' (Get-Date -Format o)
+          rclone copy $env:SESSION_DIR gdrive:wa-session
+          Set-Content "$env:TEMP/ready.txt" (Get-Date -Format o)
+          rclone copyto "$env:TEMP/ready.txt" gdrive:handoff/ready.txt
           Start-Sleep 240
